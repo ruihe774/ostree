@@ -69,6 +69,7 @@
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <gio/gunixoutputstream.h>
 
 #include <ostree-core.h>
 #include <ostree-repo-private.h>
@@ -78,6 +79,8 @@
 
 #define SYSROOT_KEY "sysroot"
 #define READONLY_KEY "readonly"
+#define PROTECT_KEY "protect"
+#define INVISIBLE_VALUE "invisible"
 
 /* This key configures the / mount in the deployment root */
 #define ROOT_KEY "root"
@@ -280,8 +283,9 @@ main (int argc, char *argv[])
   if (!config)
     errx (EXIT_FAILURE, "Failed to parse config: %s", error->message);
 
-  gboolean sysroot_readonly = FALSE;
   gboolean root_transient = FALSE;
+  gboolean sysroot_invisible = FALSE;
+  gboolean sysroot_readonly = FALSE;
 
   if (!ot_keyfile_get_boolean_with_default (config, ROOT_KEY, TRANSIENT_KEY, FALSE, &root_transient,
                                             &error))
@@ -296,10 +300,33 @@ main (int argc, char *argv[])
 
   // If composefs is enabled, that also implies sysroot.readonly=true because it's
   // the new default we want to use (not because it's actually required)
-  const bool sysroot_readonly_default = composefs_config->enabled == OT_TRISTATE_YES;
-  if (!ot_keyfile_get_boolean_with_default (config, SYSROOT_KEY, READONLY_KEY,
-                                            sysroot_readonly_default, &sysroot_readonly, &error))
-    errx (EXIT_FAILURE, "Failed to parse sysroot.readonly value: %s", error->message);
+  sysroot_readonly = composefs_config->enabled == OT_TRISTATE_YES;
+  {
+    const char *keys[] = {PROTECT_KEY, READONLY_KEY};
+    g_autofree char *value = NULL;
+    for (int i = 0; i < 2; i++)
+      {
+        if (!ot_keyfile_get_value_with_default (config, SYSROOT_KEY, keys[i], NULL, &value,
+                                                &error))
+          errx (EXIT_FAILURE, "%s", error->message);
+
+        if (value)
+          {
+            if (g_str_equal (value, INVISIBLE_VALUE))
+              {
+                sysroot_invisible = TRUE;
+                // sysroot_invisible implies sysroot_readonly
+                sysroot_readonly = TRUE;
+              }
+            else
+              {
+                if (!_ostree_parse_boolean (value, &sysroot_readonly, &error))
+                  errx (EXIT_FAILURE, "%s", error->message);
+              }
+            break;
+          }
+      }
+  }
 
   /* This is the final target where we should prepare the rootfs.  The usual
    * case with systemd in the initramfs is that root_mountpoint = "/sysroot".
@@ -503,7 +530,9 @@ main (int argc, char *argv[])
   g_variant_builder_add (&metadata_builder, "{sv}", OTCORE_RUN_BOOTED_KEY_ROOT_TRANSIENT,
                          g_variant_new_boolean (root_transient));
 
-  /* Pass on the state for use by ostree-prepare-root */
+  g_variant_builder_add (&metadata_builder, "{sv}", OTCORE_RUN_BOOTED_KEY_SYSROOT_INVISIBLE,
+                         g_variant_new_boolean (sysroot_invisible));
+
   g_variant_builder_add (&metadata_builder, "{sv}", OTCORE_RUN_BOOTED_KEY_SYSROOT_RO,
                          g_variant_new_boolean (sysroot_readonly));
 
@@ -672,12 +701,52 @@ main (int argc, char *argv[])
   if (rmdir (TMP_SYSROOT) < 0)
     err (EXIT_FAILURE, "couldn't remove temporary sysroot %s", TMP_SYSROOT);
 
-  /* Now that we've set up all the mount points, if configured we remount the physical
-   * rootfs as read-only; what is visibly mutable to the OS by default is just /etc and /var.
-   * But ostree knows how to mount /boot and /sysroot read-write to perform operations.
-   */
-  if (sysroot_readonly)
+  if (sysroot_invisible)
     {
+      /* Create a file to store st_dev and file_handle */
+      g_auto (GLnxTmpfile) tmpf = {0};
+      if (!glnx_open_tmpfile_linkable_at (AT_FDCWD, OTCORE_RUN_OSTREE_PRIVATE, O_WRONLY | O_CLOEXEC, &tmpf, &error))
+        errx (EXIT_FAILURE, "failed to create tmpfile: %s", error->message);
+      g_autoptr (GOutputStream) outstream = g_unix_output_stream_new (tmpf.fd, FALSE);
+      gsize bytes_written;
+
+      /* Get st_dev of /sysroot */
+      if (!glnx_fstatat (AT_FDCWD, "sysroot", &stbuf, 0, &error))
+        err (EXIT_FAILURE, "failed to stat /sysroot");
+
+      /* Get handle of /sysroot */
+      struct file_handle *handle = g_alloca (sizeof(struct file_handle) + MAX_HANDLE_SZ);
+      handle->handle_bytes = MAX_HANDLE_SZ;
+      int mount_id;
+      if (name_to_handle_at (AT_FDCWD, "sysroot", handle, &mount_id, 0) < 0)
+        err (EXIT_FAILURE, "failed to get file handle of /sysroot");
+
+      /* Write st_dev and file_handle */
+      if (!g_output_stream_write_all (outstream, &stbuf.st_dev, sizeof (dev_t), &bytes_written, NULL, &error))
+        errx (EXIT_FAILURE, "write failed: %s", error->message);
+      if (!g_output_stream_write_all (outstream, handle, sizeof(struct file_handle) + handle->handle_bytes, &bytes_written, NULL, &error))
+        errx (EXIT_FAILURE, "write failed: %s", error->message);
+
+      /* Link tmpf */
+      if (!g_output_stream_flush (outstream, NULL, &error))
+        errx (EXIT_FAILURE, "write failed: %s", error->message);
+      g_clear_object (&outstream);
+      if (!glnx_fchmod (tmpf.fd, 0400, &error))
+        err (EXIT_FAILURE, "fchmod failed");
+      if (!glnx_link_tmpfile_at (&tmpf, GLNX_LINK_TMPFILE_NOREPLACE, AT_FDCWD, OTCORE_RUN_OSTREE_PRIVATE "/sysroot-handle",
+                                 &error))
+        err (EXIT_FAILURE, "failed to create %s: %s", OTCORE_RUN_OSTREE_PRIVATE "/sysroot-handle", error->message);
+
+      /* Unmount /sysroot */
+      if (umount2 ("sysroot", MNT_DETACH) < 0)
+        err (EXIT_FAILURE, "failed to umount /sysroot");
+    }
+  else if (sysroot_readonly)
+    {
+      /* Now that we've set up all the mount points, if configured we remount the physical
+       * rootfs as read-only; what is visibly mutable to the OS by default is just /etc and /var.
+       * But ostree knows how to mount /boot and /sysroot read-write to perform operations.
+       */
       if (mount ("sysroot", "sysroot", NULL, MS_BIND | MS_REMOUNT | MS_RDONLY | MS_SILENT, NULL)
           < 0)
         err (EXIT_FAILURE, "failed to make /sysroot read-only");
