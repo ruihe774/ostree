@@ -374,6 +374,88 @@ remount_writable (const char *path, gboolean *did_remount, GError **error)
   return TRUE;
 }
 
+static gboolean
+_ostree_sysroot_invisible (const OstreeSysroot *self, gboolean *out_val, GError **error)
+{
+  g_assert (self->sysroot_fd >= 0);
+  g_assert (self->root_is_ostree_booted);
+
+  if (!glnx_fstatat_allow_noent (self->sysroot_fd, "ostree/repo", NULL, 0, error))
+    return FALSE;
+
+  if (errno == 0)
+    {
+      *out_val = FALSE;
+      return TRUE;
+    }
+
+  // root_is_ostree_booted is true so we can use AT_FDCWD here
+  if (!glnx_fstatat_allow_noent (AT_FDCWD, OTCORE_RUN_OSTREE_PRIVATE "/sysroot-handle", NULL, 0, error))
+    return FALSE;
+
+  if (errno != 0)
+    {
+      *out_val = FALSE;
+      return TRUE;
+    }
+
+  *out_val = TRUE;
+  return TRUE;
+}
+
+/* Make /sysroot visible */
+static gboolean
+_ostree_sysroot_ensure_visible (OstreeSysroot *self, GError **error)
+{
+  gboolean invisible;
+  if (!_ostree_sysroot_invisible (self, &invisible, error))
+    return FALSE;
+
+  if (!invisible)
+    return TRUE;
+
+  /* Boot may reside on the original sysroot.
+   * To prevent from losing it, try ensuring it now.
+   */
+  if (!_ostree_sysroot_ensure_boot_fd (self, error))
+    {
+      // ignore failure
+    }
+
+  glnx_autofd int handle_fd = -1;
+  if (!glnx_openat_rdonly (AT_FDCWD, OTCORE_RUN_OSTREE_PRIVATE "/sysroot-handle", TRUE, &handle_fd, error))
+    return FALSE;
+
+  g_autoptr (GBytes) bytes = NULL;
+  if ((bytes = glnx_fd_readall_bytes (handle_fd, NULL, error)) == NULL)
+    return FALSE;
+
+  gsize size;
+  gconstpointer data = g_bytes_get_data (bytes, &size);
+  g_assert (size > sizeof (dev_t) + sizeof (struct file_handle));
+  dev_t sysroot_dev = *(dev_t *)data;
+  struct file_handle *sysroot_handle = (struct file_handle *)((const char *)data + sizeof (dev_t));
+  g_assert (size == sizeof (dev_t) + sizeof (struct file_handle) + sysroot_handle->handle_bytes);
+
+  glnx_autofd int etc_fd = -1;
+  if (!glnx_opendirat (AT_FDCWD, "/etc", TRUE, &etc_fd, error))
+    return FALSE;
+  struct stat stbuf;
+  if (!glnx_fstat (etc_fd, &stbuf, error))
+    return FALSE;
+  if (stbuf.st_dev != sysroot_dev)
+    return glnx_throw (error, "/etc is not bind-mounted from /sysroot");
+
+  glnx_autofd int sysroot_fd = open_by_handle_at (etc_fd, sysroot_handle, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (sysroot_fd < 0)
+    return glnx_throw_errno_prefix (error, "open_by_handle_at");
+
+  glnx_close_fd (&self->sysroot_fd);
+  self->sysroot_fd = g_steal_fd (&sysroot_fd);
+
+  return TRUE;
+}
+
 /* Remount /sysroot read-write if necessary */
 gboolean
 _ostree_sysroot_ensure_writable (OstreeSysroot *self, GError **error)
@@ -801,6 +883,10 @@ parse_deployment (OstreeSysroot *self, const char *boot_link, OstreeDeployment *
   if (!_ostree_sysroot_parse_deploy_path_name (deploy_basename, &treecsum, &deployserial, error))
     return FALSE;
 
+  g_autofree char *relative_file_name = g_strdup_printf ("../%s", treebootserial_target);
+  g_autofree char *absolute_boot_link = g_strdup_printf ("/%s", relative_boot_link);
+  g_autofree char *canonicalized_boot_link = g_canonicalize_filename (relative_file_name, absolute_boot_link);
+  relative_boot_link = canonicalized_boot_link + 1;
   glnx_autofd int deployment_dfd = -1;
   if (!glnx_opendirat (self->sysroot_fd, relative_boot_link, TRUE, &deployment_dfd, error))
     return FALSE;
@@ -1061,6 +1147,13 @@ ostree_sysroot_initialize (OstreeSysroot *self, GError **error)
 
       self->root_is_ostree_booted = (ostree_booted && root_is_sysroot);
       g_debug ("root_is_ostree_booted: %d", self->root_is_ostree_booted);
+
+      if (self->root_is_ostree_booted)
+        {
+          if (!_ostree_sysroot_ensure_visible (self, error))
+            return FALSE;
+        }
+
       self->loadstate = OSTREE_SYSROOT_LOAD_STATE_INIT;
     }
 
